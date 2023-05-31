@@ -1,4 +1,4 @@
-FROM nixos/nix
+FROM nixos/nix:latest-amd64
 
 WORKDIR /app
 
