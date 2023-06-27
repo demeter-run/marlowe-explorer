@@ -1,33 +1,36 @@
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE MonoLocalBinds #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 module Explorer.Web.ContractView
   (ContractView(..), contractView)
   where
 
-import Control.Monad (forM_, forM)
+import Control.Monad (forM_, forM, join)
 import Control.Monad.Extra (whenMaybe)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Text (unpack)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import GHC.Utils.Misc (split)
-import Text.Blaze.Html5 (Html, Markup, ToMarkup(toMarkup), (!), a, b, code, p, string, ToValue (toValue))
+import Text.Blaze.Html5 (Html, Markup, ToMarkup(toMarkup), (!), a, b, code, p, string, ToValue (toValue), pre)
 import qualified Text.Blaze.Html5 as H
 import Text.Blaze.Html5.Attributes (href, style, class_)
 import Text.Printf (printf)
-import Explorer.Web.Util (tr, th, td, table, baseDoc, stringToHtml, prettyPrintAmount, makeLocalDateTime,
-                          generateLink, mkTransactionExplorerLink, mkBlockExplorerLink, mkTokenPolicyExplorerLink,
-                          valueToString, SyncStatus, downloadIcon, contractIdIcon, blockHeaderHashIcon,
+import Explorer.Web.Util (tr, baseDoc, stringToHtml, prettyPrintAmount, makeLocalDateTime, generateLink,
+                          mkTransactionExplorerLink, mkBlockExplorerLink, mkTokenPolicyExplorerLink,
+                          valueToString, SyncStatus, downloadIcon, bookIcon, blockHeaderHashIcon,
                           roleTokenMintingPolicyIdIcon, slotNoIcon, blockNoIcon, metadataIcon, versionIcon,
-                          statusIcon, dtd, inactiveLight, activeLight, mtd, dtable, makeTitleDiv)
+                          statusIcon, dtd, inactiveLight, activeLight, mtd, dtable, makeTitleDiv, stateIcon,
+                          createFullPopUp, alarmClockIcon, pptable, pptr, ppth, pptd, pptdWe, tableList, tlhr,
+                          tlh, tlr, tldhc, tld, createPopUpLauncher, createPopUp, PopupLevel (..), circleIcon)
 import Language.Marlowe.Pretty (pretty)
 import qualified Language.Marlowe.Runtime.Types.ContractJSON as CJ
 import qualified Language.Marlowe.Runtime.Types.TransactionsJSON as TJs
 import qualified Language.Marlowe.Runtime.Types.TransactionJSON as TJ
-import Language.Marlowe.Semantics.Types (ChoiceId(..), Contract, Input(..), Money, POSIXTime(..), Party(..),
-                                         State(..), Token(..), ValueId(..))
+import Language.Marlowe.Semantics.Types (ChoiceId(..), Contract, Input(..), Money, POSIXTime(..),
+                                         Party(..), State(..), Token(..), ValueId(..), InputContent(..))
 import Opts (Options (optBlockExplorerHost, Options), mkUrlPrefix, BlockExplorerHost (BlockExplorerHost))
 import Control.Monad.Except (runExceptT, ExceptT (ExceptT))
 import Prelude hiding (div)
@@ -35,12 +38,16 @@ import Data.Time (UTCTime)
 import qualified Data.Text as T
 import qualified Data.Map as M
 import Explorer.SharedContractCache (ContractListCacheStatusReader(getSyncStatus))
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, catMaybes, fromMaybe)
+import Explorer.Web.Pagination (bindVal, calcLastPage, calculateRange, PageInfo (..), PageLinkGenerator, renderNavBar)
+import qualified Data.ByteString.Char8 as BS
+import qualified Data.ByteString.Base16 as BS16
 
-contractView :: ContractListCacheStatusReader contractCache => Options -> contractCache -> Maybe String -> Maybe String -> Maybe String -> IO ContractView
-contractView opts contractCache mTab mCid mTxId = do
+contractView :: ContractListCacheStatusReader contractCache => Options -> contractCache -> Maybe String -> Maybe String
+                                                            -> Maybe Int -> Maybe String -> IO ContractView
+contractView opts contractCache mTab mCid mPage mTxId = do
   curSyncStatus <- getSyncStatus contractCache
-  cData <- contractViewInner opts mTab mCid mTxId
+  cData <- contractViewInner opts mTab mCid mPage mTxId
   return $ ContractView { cvRetrievalSyncStatus = curSyncStatus
                         , cvMContractId = getMaybeContractId cData
                         , cvData = cData
@@ -49,54 +56,53 @@ contractView opts contractCache mTab mCid mTxId = do
 getMaybeContractId :: CV -> Maybe String
 getMaybeContractId (ContractInfoView CIVR { civrContractId = cid }) = Just cid
 getMaybeContractId (ContractStateView CSVR { csvrContractId = cid }) = Just cid
-getMaybeContractId (ContractTxView CTVRs { ctvrsContractId = cid } ) = Just cid
+getMaybeContractId (ContractTxListView CTLVRs { ctlvrsContractId = cid } ) = Just cid
+getMaybeContractId (ContractTxView CTVR { ctvrContractId = cid } ) = Just cid
 getMaybeContractId (ContractViewError _) = Nothing
 
-contractViewInner :: Options -> Maybe String -> Maybe String -> Maybe String -> IO CV
-contractViewInner opts@(Options {optBlockExplorerHost = BlockExplorerHost blockExplHost}) mTab (Just cid) mTxId = do
+contractViewInner :: Options -> Maybe String -> Maybe String -> Maybe Int -> Maybe String -> IO CV
+contractViewInner opts@(Options {optBlockExplorerHost = BlockExplorerHost blockExplHost}) mTab (Just cid) mPage mTxId = do
   let urlPrefix = mkUrlPrefix opts
       tab = parseTab mTab
-
   r <- runExceptT (do cjson <- ExceptT $ CJ.getContractJSON urlPrefix cid
                       let link = CJ.transactions $ CJ.links cjson
-                      txsjson <- whenMaybe (tab == CTxView)
+                      txsjson <- whenMaybe (tab == CTxListView)
                                            $ ExceptT $ TJs.getContractTransactionsByLink urlPrefix link
-                      let mTxId2 = getIfInContractDefaultFirst mTxId txsjson
-                      txjson <- forM mTxId2 (ExceptT . TJ.getTransaction urlPrefix link)
-                      return $ extractInfo tab blockExplHost cjson txsjson txjson)
+                      txjson <- join <$> whenMaybe (tab == CTxView)
+                                                   (forM mTxId (ExceptT . TJ.getTransaction urlPrefix link))
+                      return $ extractInfo tab blockExplHost mPage cjson txsjson txjson)
   return $ either ContractViewError id r
-contractViewInner opts Nothing cid txId = contractViewInner opts (Just "state") cid txId
-contractViewInner _opts _tab Nothing _txId = return $ ContractViewError "Need to specify a contractId"
-
-
-getIfInContractDefaultFirst :: Maybe String -> Maybe TJs.Transactions -> Maybe String
-getIfInContractDefaultFirst mTxId@(Just txId) (Just (TJs.Transactions { TJs.transactions = txList })) =
-  if any ((== txId) . TJs.transactionId . TJs.resource) txList then mTxId else Nothing
-getIfInContractDefaultFirst Nothing (Just (TJs.Transactions { TJs.transactions = tns@(_:_) } )) =
-  Just (TJs.transactionId $ TJs.resource $ last tns)
-getIfInContractDefaultFirst _ _ = Nothing
-
+contractViewInner opts Nothing cid mPage txId = contractViewInner opts (Just "state") cid mPage txId
+contractViewInner _opts _tab Nothing _ _txId = return $ ContractViewError "Need to specify a contractId"
 
 parseTab :: Maybe String -> ContractViews
 parseTab (Just "state") = CStateView
-parseTab (Just "txs") = CTxView
+parseTab (Just "tx-list") = CTxListView
+parseTab (Just "tx") = CTxView
 parseTab _ = CInfoView
 
+-- Number of transactions per page
+pageLength :: Int
+pageLength = 12
 
-extractInfo :: ContractViews -> String -> CJ.ContractJSON -> Maybe TJs.Transactions -> Maybe TJ.Transaction -> CV
-extractInfo CInfoView blockExplHost CJ.ContractJSON { CJ.resource =
-                                         (CJ.Resource { CJ.block = CJ.Block { CJ.blockHeaderHash = blkHash
-                                                                            , CJ.blockNo = blkNo
-                                                                            , CJ.slotNo = sltNo
-                                                                            }
-                                                      , CJ.contractId = cid
-                                                      , CJ.currentContract = currContract
-                                                      , CJ.metadata =_metadata
-                                                      , CJ.roleTokenMintingPolicyId = mintingPolicyId
-                                                      , CJ.tags = tagsMap
-                                                      , CJ.version = ver
-                                                      })
-                                                     } _ _ =
+-- Number of pages to each side to show (unless close to border)
+contextPages :: Int
+contextPages = 3
+
+extractInfo :: ContractViews -> String -> Maybe Int -> CJ.ContractJSON -> Maybe TJs.Transactions -> Maybe TJ.Transaction -> CV
+extractInfo CInfoView blockExplHost _ CJ.ContractJSON { CJ.resource =
+                                           (CJ.Resource { CJ.block = CJ.Block { CJ.blockHeaderHash = blkHash
+                                                                              , CJ.blockNo = blkNo
+                                                                              , CJ.slotNo = sltNo
+                                                                              }
+                                                        , CJ.contractId = cid
+                                                        , CJ.currentContract = currContract
+                                                        , CJ.metadata =_metadata
+                                                        , CJ.roleTokenMintingPolicyId = mintingPolicyId
+                                                        , CJ.tags = tagsMap
+                                                        , CJ.version = ver
+                                                        })
+                                                      } _ _ =
   ContractInfoView
       (CIVR { civrIsActive = isJust currContract
             , civrContractId = cid
@@ -110,13 +116,13 @@ extractInfo CInfoView blockExplHost CJ.ContractJSON { CJ.resource =
             , civrTags = fmap valueToString tagsMap
             , civrVersion = ver
             })
-extractInfo CStateView blockExplHost CJ.ContractJSON { CJ.resource =
-                                         (CJ.Resource { CJ.contractId = cid
-                                                      , CJ.currentContract = currContract
-                                                      , CJ.initialContract = initContract
-                                                      , CJ.state = currState
-                                                      })
-                                                     } _ _ =
+extractInfo CStateView blockExplHost _ CJ.ContractJSON { CJ.resource =
+                                           (CJ.Resource { CJ.contractId = cid
+                                                        , CJ.currentContract = currContract
+                                                        , CJ.initialContract = initContract
+                                                        , CJ.state = currState
+                                                        })
+                                                       } _ _ =
   ContractStateView
       (CSVR { csvrContractId = cid
             , csvrContractIdLink = mkTransactionExplorerLink  blockExplHost cid
@@ -125,15 +131,29 @@ extractInfo CStateView blockExplHost CJ.ContractJSON { CJ.resource =
             , currentState = currState
             , csvrBlockExplHost = blockExplHost
             })
-extractInfo CTxView blockExplHost CJ.ContractJSON { CJ.resource = CJ.Resource { CJ.contractId = cid }
-                                                  }
+extractInfo CTxListView blockExplHost mbPage CJ.ContractJSON { CJ.resource = CJ.Resource { CJ.contractId = cid }
+                                                        }
             (Just (TJs.Transactions { TJs.transactions = txs })) mTx =
-  ContractTxView $ CTVRs { ctvrsContractId = cid
-                         , ctvrs = map convertTx $ reverse txs
-                         , ctvrsSelectedTransactionInfo = fmap (convertTxDetails blockExplHost) mTx
-                         , ctvrsBlockExplHost = blockExplHost
-                         }
+  ContractTxListView $ CTLVRs { ctlvrsContractId = cid
+                              , ctlvrs = map convertTx transactions
+                              , ctlvrsSelectedTransactionInfo = fmap (convertTxDetails blockExplHost) mTx
+                              , ctlvrsBlockExplHost = blockExplHost
+                              , ctlvrsPageInfo = PageInfo { currentPage = cPage
+                                                          , pageRange = (minPage, maxPage)
+                                                          , totalItems = numTransactions
+                                                          , contractRange = (firstTransaction, lastTransaction)
+                                                          , numPages = lastPage
+                                                          }
+                              }
   where
+    firstTransaction = transactionsBefore + 1
+    lastTransaction = transactionsBefore + length transactions
+    transactionsBefore = pageLength * (cPage - 1)
+    transactions = take pageLength $ drop transactionsBefore (reverse txs)
+    numTransactions = length txs
+    cPage = bindVal 1 lastPage $ fromMaybe 1 mbPage
+    lastPage = calcLastPage pageLength numTransactions
+    (minPage, maxPage) = calculateRange contextPages cPage lastPage
     convertTx TJs.Transaction { TJs.resource = TJs.Resource { TJs.block = TJs.Block { TJs.blockNo = blockNo'
                                                                                     , TJs.slotNo = slotNo'
                                                                                     }
@@ -141,16 +161,24 @@ extractInfo CTxView blockExplHost CJ.ContractJSON { CJ.resource = CJ.Resource { 
                                                             , TJs.transactionId = transactionId'
                                                             }
                               } =
-                   CTVR { ctvrBlock = blockNo'
-                        , ctvrBlockLink = mkBlockExplorerLink blockExplHost blockNo'
-                        , ctvrSlot = slotNo'
-                        , ctvrContractId = txContractId
-                        , ctvrTransactionId = transactionId'
+                   CTLVR { ctlvrBlock = blockNo'
+                         , ctlvrBlockLink = mkBlockExplorerLink blockExplHost blockNo'
+                         , ctlvrSlot = slotNo'
+                         , ctlvrContractId = txContractId
+                         , ctlvrTransactionId = transactionId'
+                         }
+extractInfo CTxView blockExplHost _ CJ.ContractJSON { CJ.resource = CJ.Resource { CJ.contractId = cid }
+                                                    }
+            _ (Just tx) =
+  ContractTxView $ CTVR { ctvrContractId = cid
+                        , ctvrSelectedTransactionInfo = convertTxDetails blockExplHost tx
+                        , ctvrBlockExplHost = blockExplHost
                         }
-extractInfo _ _blockExplHost _ Nothing _ = ContractViewError "Something went wrong, unable to display"
+extractInfo CTxView _ _ _ _ Nothing = ContractViewError "Unable to find transaction to display"
+extractInfo CTxListView _ _ _ Nothing _ = ContractViewError "Unable to fetch transaction list"
 
 
-convertTxDetails :: String -> TJ.Transaction -> CTVRTDetail
+convertTxDetails :: String -> TJ.Transaction -> CTLVRTDetail
 convertTxDetails blockExplHost TJ.Transaction { TJ.links = TJ.Link { TJ.next = mNext
                                                                    , TJ.previous = mPrev
                                                                    }
@@ -168,7 +196,7 @@ convertTxDetails blockExplHost TJ.Transaction { TJ.links = TJ.Link { TJ.next = m
                                                                           , TJ.transactionId = txDetailTransactionId
                                                                           }
                                               }
-  = CTVRTDetail { txPrev= mPrev
+  = CTLVRTDetail { txPrev= mPrev
                 , txNext= mNext
                 , txBlockHeaderHash = txDetailBlockHeaderHash
                 , txBlockNo = txDetailBlockNo
@@ -186,20 +214,23 @@ convertTxDetails blockExplHost TJ.Transaction { TJ.links = TJ.Link { TJ.next = m
 
 
 allContractViews :: [ContractViews]
-allContractViews = [CInfoView, CStateView, CTxView]
+allContractViews = [CInfoView, CStateView, CTxListView]
 
 getNavTab :: ContractViews -> String
 getNavTab CInfoView = "info"
 getNavTab CStateView = "state"
-getNavTab CTxView = "txs"
+getNavTab CTxListView = "tx-list"
+getNavTab CTxView = "tx"
 
 getNavTitle :: ContractViews -> String
 getNavTitle CInfoView = "Details"
 getNavTitle CStateView = "Code"
-getNavTitle CTxView = "Transactions"
+getNavTitle CTxListView = "Transactions"
+getNavTitle CTxView = "Transaction Details"
 
 data ContractViews = CInfoView
                    | CStateView
+                   | CTxListView
                    | CTxView
   deriving (Show, Eq)
 
@@ -232,7 +263,8 @@ instance ToMarkup ContractView where
 
 data CV = ContractInfoView CIVR
         | ContractStateView CSVR
-        | ContractTxView CTVRs
+        | ContractTxListView CTLVRs
+        | ContractTxView CTVR
         | ContractViewError String
 
 instance ToMarkup CV where
@@ -241,10 +273,13 @@ instance ToMarkup CV where
     addNavBar CInfoView cid $ renderCIVR cvr
   toMarkup (ContractStateView ccsr@(CSVR {csvrContractId = cid})) =
     addNavBar CStateView cid $ renderCSVR ccsr
-  toMarkup (ContractTxView ctvrs'@CTVRs {ctvrsContractId = cid}) =
-    addNavBar CTxView cid $ renderCTVRs ctvrs'
+  toMarkup (ContractTxListView ctlvrs'@CTLVRs {ctlvrsContractId = cid}) =
+    addNavBar CTxListView cid $ renderCTLVRs ctlvrs'
+  toMarkup (ContractTxView ctlvrs'@CTVR {ctvrContractId = cid}) =
+    addNavBar CTxView cid $ renderCTVR ctlvrs'
   toMarkup (ContractViewError str) =
     string $ "Error: " ++ str
+
 
 data CIVR = CIVR { civrIsActive :: Bool
                  , civrContractId :: String
@@ -277,7 +312,7 @@ renderCIVR (CIVR { civrContractId = cid
                       mtd $ do H.span ! class_ "icon-margin-right"
                                       $ if contractStatus then activeLight else inactiveLight
                                H.span $ string $ if contractStatus then "Active" else "Closed"
-              tr $ do dtd $ do contractIdIcon
+              tr $ do dtd $ do bookIcon
                                string "Contract ID"
                       mtd $ a ! href (toValue cidLink) $ string cid
               tr $ do dtd $ do blockHeaderHashIcon
@@ -310,156 +345,255 @@ data CSVR = CSVR { csvrContractId :: String
 renderCSVR :: CSVR -> Html
 renderCSVR (CSVR { csvrContractId = cid
                  , csvrContractIdLink = cidLink
-                 , currentContract = cc
                  , initialContract = ic
                  , currentState = cs
                  , csvrBlockExplHost = blockExplHost
-                 }) =
-  table $ do tr $ do td $ b "Contract ID"
-                     td $ a ! href (toValue cidLink) $ string cid
-             tr $ do td $ b "Current contract"
-                     td $ renderMContract cc
-             tr $ do td $ b "Current state"
-                     td $ renderMState blockExplHost cs
-             tr $ do td $ b "Initial contract"
-                     td $ renderMContract (Just ic)
+                 }) = do
+  dtable $ do tr $ do dtd $ do bookIcon
+                               string "Contract ID"
+                      mtd $ a ! href (toValue cidLink) $ string cid
+              tr $ do dtd $ do stateIcon
+                               string "Current state"
+                      mtd $ renderMState blockExplHost cs
+              renderMminTime cs
+  renderMContract (Just ic)
 
-data CTVRTDetail = CTVRTDetail
-  {
-    txPrev :: Maybe String,
-    txNext :: Maybe String,
-    txBlockHeaderHash :: String,
-    txBlockNo :: Integer,
-    txBlockLink :: String,
-    txSlotNo :: Integer,
-    inputs :: [Input],
-    invalidBefore :: UTCTime,
-    invalidHereafter :: UTCTime,
-    outputContract :: Maybe Contract,
-    outputState :: Maybe State,
-    txStatus :: String,
-    txTags :: Map String String,
-    transactionId :: String
+renderMminTime :: Maybe State -> Html
+renderMminTime cs = case cs of
+                      Nothing -> return mempty
+                      Just (State { minTime = mtime }) ->
+                        tr $ do dtd $ do alarmClockIcon
+                                         string "minTime"
+                                mtd $ do renderTime mtime
+                                         string $ " (POSIX: " ++ show mtime ++ ")"
+
+data CTLVRTDetail = CTLVRTDetail
+  { txPrev :: Maybe String
+  , txNext :: Maybe String
+  , txBlockHeaderHash :: String
+  , txBlockNo :: Integer
+  , txBlockLink :: String
+  , txSlotNo :: Integer
+  , inputs :: [Input]
+  , invalidBefore :: UTCTime
+  , invalidHereafter :: UTCTime
+  , outputContract :: Maybe Contract
+  , outputState :: Maybe State
+  , txStatus :: String
+  , txTags :: Map String String
+  , transactionId :: String
+  }
+  deriving Show
+
+data CTLVR = CTLVR
+  { ctlvrBlock :: Integer
+  , ctlvrBlockLink :: String
+  , ctlvrSlot :: Integer
+  , ctlvrContractId :: String
+  , ctlvrTransactionId :: String
+  }
+  deriving Show
+
+data CTLVRs = CTLVRs
+  { ctlvrsContractId :: String
+  , ctlvrs :: [CTLVR]
+  , ctlvrsSelectedTransactionInfo :: Maybe CTLVRTDetail
+  , ctlvrsBlockExplHost :: String
+  , ctlvrsPageInfo :: PageInfo
   }
   deriving Show
 
 data CTVR = CTVR
-  { ctvrBlock :: Integer
-  , ctvrBlockLink :: String
-  , ctvrSlot :: Integer
-  , ctvrContractId :: String
-  , ctvrTransactionId :: String
+  { ctvrContractId :: String
+  , ctvrSelectedTransactionInfo :: CTLVRTDetail
+  , ctvrBlockExplHost :: String
   }
   deriving Show
 
-data CTVRs = CTVRs {
-    ctvrsContractId :: String
-  , ctvrs :: [CTVR]
-  , ctvrsSelectedTransactionInfo :: Maybe CTVRTDetail
-  , ctvrsBlockExplHost :: String
-}
+renderCTLVRs :: CTLVRs -> Html
+renderCTLVRs CTLVRs { ctlvrs = [] } = p ! style "color: red" $ string "There are no transactions"
+renderCTLVRs CTLVRs { ctlvrsContractId = cid
+                    , ctlvrs = ctlvrs'
+                    , ctlvrsSelectedTransactionInfo = ctlvrsSelectedTransactionInfo'
+                    , ctlvrsPageInfo = pinf@(PageInfo { currentPage = page
+                                                      , totalItems = numTransactions
+                                                      , contractRange = (firstTransaction, lastTransaction)
+                                                      , numPages = lastPage
+                                                      })
+                    } = do
+  p $ string $ printf "%d-%d transactions shown out of %d, (page %d out of %d)"
+                        firstTransaction lastTransaction numTransactions page lastPage
+  tableList $ do
+    tlhr $ do
+      tlh $ b "Transaction ID"
+      tlh $ b "Block No"
+      tlh $ b "Slot No"
+    forM_ ctlvrs' makeRow
+  renderNavBar generateLink' pinf
+  where makeRow CTLVR { ctlvrBlock = ctlvrBlock'
+                      , ctlvrSlot = ctlvrSlot'
+                      , ctlvrContractId = ctlvrContractId'
+                      , ctlvrTransactionId = ctlvrTransactionId'
+                      } = do
+          tlr $ do
+            tldhc $ if Just ctlvrTransactionId' /= fmap transactionId ctlvrsSelectedTransactionInfo'
+                    then linkToTransaction ctlvrContractId' ctlvrTransactionId' ctlvrTransactionId'
+                    else string ctlvrTransactionId'
+            tld $ string $ show ctlvrBlock'
+            tld $ string $ show ctlvrSlot'
+
+        generateLink' :: PageLinkGenerator
+        generateLink' targetPage = a ! class_ "invisible-link"
+                                     ! href (toValue $ generateLink "contractView"
+                                                                    [ ("tab", getNavTab CTxListView)
+                                                                    , ("contractId", cid)
+                                                                    , ("page", show targetPage)
+                                                                    ])
 
 
-renderCTVRs :: CTVRs -> Html
-renderCTVRs CTVRs { ctvrs = [] } = p ! style "color: red" $ string "There are no transactions"
-renderCTVRs CTVRs { ctvrsContractId = ctvrsContractId'
-                  , ctvrs = ctvrs'
-                  , ctvrsSelectedTransactionInfo = ctvrsSelectedTransactionInfo'
-                  , ctvrsBlockExplHost = blockExplHost
-                  } = do
-  table $ do
+renderCTLVRTDetail :: String -> String -> CTLVRTDetail -> Html
+renderCTLVRTDetail cid blockExplHost (CTLVRTDetail { txPrev = txPrev'
+                                                   , txNext = txNext'
+                                                   , txBlockHeaderHash = txBlockHeaderHash'
+                                                   , txBlockNo = txBlockNo'
+                                                   , txBlockLink = txBlockLink'
+                                                   , txSlotNo = txSlotNo'
+                                                   , inputs = inputs'
+                                                   , invalidBefore = invalidBefore'
+                                                   , invalidHereafter = invalidHereafter'
+                                                   , outputContract = outputContract'
+                                                   , outputState = outputState'
+                                                   , txTags = tags'
+                                                   , transactionId = transactionId'
+                                                   }) = do
+  H.div ! class_ "pagination-box"
+        $ do p $ string ""
+             maybe (H.div $ previousTransactionLabel False) (explorerTransactionLinkFromRuntimeLink previousTransactionLabel) txPrev'
+             maybe (H.div $ nextTransactionLabel False) (explorerTransactionLinkFromRuntimeLink nextTransactionLabel) txNext'
+             p $ string ""
+  dtable $ do
     tr $ do
-      th $ b "Transaction ID"
-      th $ b "Block No"
-      th $ b "Slot No"
-    forM_ ctvrs' makeRow
-  renderCTVRTDetail ctvrsContractId' blockExplHost ctvrsSelectedTransactionInfo'
-  where makeRow CTVR { ctvrBlock = ctvrBlock'
-                     , ctvrSlot = ctvrSlot'
-                     , ctvrContractId = ctvrContractId'
-                     , ctvrTransactionId = ctvrTransactionId'
-                     } = do
-          tr $ do
-            td $ if Just ctvrTransactionId' /= fmap transactionId ctvrsSelectedTransactionInfo'
-                 then linkToTransaction ctvrContractId' ctvrTransactionId' ctvrTransactionId'
-                 else string ctvrTransactionId'
-            td $ string $ show ctvrBlock'
-            td $ string $ show ctvrSlot'
-
-renderCTVRTDetail :: String -> String -> Maybe CTVRTDetail -> Html
-renderCTVRTDetail _cid _blockExplHost Nothing = do p $ string "Select a transaction to view its details"
-renderCTVRTDetail cid blockExplHost (Just CTVRTDetail { txPrev = txPrev'
-                                                      , txNext = txNext'
-                                                      , txBlockHeaderHash = txBlockHeaderHash'
-                                                      , txBlockNo = txBlockNo'
-                                                      , txBlockLink = txBlockLink'
-                                                      , txSlotNo = txSlotNo'
-                                                      , inputs = inputs'
-                                                      , invalidBefore = invalidBefore'
-                                                      , invalidHereafter = invalidHereafter'
-                                                      , outputContract = outputContract'
-                                                      , outputState = outputState'
-                                                      , txStatus = txStatus'
-                                                      , txTags = tags'
-                                                      , transactionId = transactionId'
-                                                      }) =
-  table $ do
-  tr $ do
-    td $ maybe (string previousTransactionLabel) (explorerTransactionLinkFromRuntimeLink previousTransactionLabel) txPrev'
-    td $ maybe (string nextTransactionLabel) (explorerTransactionLinkFromRuntimeLink nextTransactionLabel) txNext'
-  table $ do
+      dtd $ do bookIcon
+               string "Transaction Id"
+      mtd $ a ! href (toValue $ "https://" ++ blockExplHost ++ "/transaction/" ++ transactionId') $ string transactionId'
     tr $ do
-      td $ b "Block header hash"
-      td $ string txBlockHeaderHash'
+      dtd $ do alarmClockIcon
+               string "Invalid before"
+      mtd $ makeLocalDateTime invalidBefore'
     tr $ do
-      td $ b "Block number"
-      td $ a ! href (toValue txBlockLink') $ string $ show txBlockNo'
+      dtd $ do alarmClockIcon
+               string "Invalid after"
+      mtd $ makeLocalDateTime invalidHereafter'
     tr $ do
-      td $ b "Slot number"
-      td $ string $ show txSlotNo'
+      dtd $ do slotNoIcon
+               string "Slot number"
+      mtd $ string $ show txSlotNo'
     tr $ do
-      td $ b "Inputs"
-      td $ do if null inputs'
-              then string "No inputs"
-              else table $ do
-                     mapM_ (\inp -> do tr $ td $ code $ stringToHtml $ show $ pretty inp) inputs'
+      dtd $ do blockHeaderHashIcon
+               string "Block header hash"
+      mtd $ string txBlockHeaderHash'
     tr $ do
-      td $ b "Invalid before"
-      td $ makeLocalDateTime invalidBefore'
+      dtd $ do blockNoIcon
+               string "Block number"
+      mtd $ a ! href (toValue txBlockLink') $ string $ show txBlockNo'
     tr $ do
-      td $ b "Invalid after"
-      td $ makeLocalDateTime invalidHereafter'
+      dtd $ do circleIcon
+               string "Inputs"
+      mtd $ do if null inputs'
+               then string "No inputs"
+               else createInputsPopup blockExplHost inputs'
     tr $ do
-      td $ b "Output Contract"
-      td $ renderMContract outputContract'
+      dtd $ do stateIcon
+               string "Output State"
+      mtd $ renderMState blockExplHost outputState'
+    case outputState' of
+      Nothing -> return mempty
+      Just (State { minTime = mtime }) ->
+        tr $ do dtd $ do alarmClockIcon
+                         string "minTime"
+                mtd $ do renderTime mtime
+                         string $ " (POSIX: " ++ show mtime ++ ")"
     tr $ do
-      td $ b "Output State"
-      td $ renderMState blockExplHost outputState'
-    tr $ do
-      td $ b "Status"
-      td $ string txStatus'
-    tr $ do
-      td $ b "Tags"
-      td $ renderTags tags'
-    tr $ do
-      td $ b "Transaction Id"
-      td $ a ! href (toValue $ "https://" ++ blockExplHost ++ "/transaction/" ++ transactionId') $ string transactionId'
-  where previousTransactionLabel = "< Previous Transaction"
-        nextTransactionLabel = "Next Transaction >"
-        explorerTransactionLinkFromRuntimeLink label rtTxLink =
+      dtd $ do metadataIcon
+               string "Tags"
+      mtd $ renderTags tags'
+  renderMContract outputContract'
+  where previousTransactionLabel enabled = makeTransactionLabel enabled "Previous Transaction"
+        nextTransactionLabel enabled = makeTransactionLabel enabled "Next Transaction"
+        makeTransactionLabel enabled = H.div ! class_ (if enabled then "page-button" else "page-button page-button-disabled")
+        explorerTransactionLinkFromRuntimeLink linkContent rtTxLink =
           case split '/' rtTxLink of
-            [_, _, _, tTransactionId] -> linkToTransaction cid tTransactionId label
-            _ -> string label
+            [_, _, _, tTransactionId] -> invisibleLinkToTransaction cid tTransactionId $ linkContent True
+            _ -> H.div $ linkContent False
+
+createInputsPopup :: String -> [Input] -> Html
+createInputsPopup blockExplHost inputs' = do
+  createFullPopUp "inputs" (show numInputs ++ " Input" ++ s)
+                           inputsTable
+  sequence_ popups
+  where (inputsTable, popups) = renderInputs blockExplHost inputs'
+        numInputs = length inputs'
+        s | numInputs == 1 = ""
+          | otherwise = "s"
+
+renderInputs :: String -> [Input] -> (Html, [Html])
+renderInputs blockExplHost inputs' = (pptable $ do
+  pptr $ do
+    ppth "Input type"
+    ppth "Input owner"
+    ppth "Details"
+    ppth "Value"
+    ppth "Continuation hash"
+    ppth "Continuation contract"
+  sequence_ rows, popups)
+  where
+    (rows, popups) = unzip $ [ renderInput blockExplHost idx inp
+                             | (idx, inp) <- zip [1..] inputs' ]
+
+renderInput :: String -> Integer -> Input -> (Html, Html)
+renderInput blockExplHost _idx (NormalInput ic) =
+  ( pptr $ do renderInputContent blockExplHost ic
+              pptd $ string ""
+              pptd $ string ""
+  , mempty )
+renderInput blockExplHost idx (MerkleizedInput ic chash cont) =
+  ( pptr $ do renderInputContent blockExplHost ic
+              pptdWe $ string $ BS.unpack $ BS16.encode chash
+              pptd $ createPopUpLauncher popupId "Contract"
+  , createPopUp PopupLevel2 popupId (renderMContract (Just cont)) )
+ where popupId = "contract-" ++ show idx
+
+renderInputContent :: String -> InputContent -> Html
+renderInputContent blockExplHost (IDeposit party1 party2 token money) = do
+  pptd "Deposit"
+  pptdWe $ renderParty blockExplHost party2
+  pptdWe $ do string "Account: "
+              renderParty blockExplHost party1
+  pptdWe $ string $ pamount ++ " " ++ tok
+  where (tok, pamount) = renderToken token money
+renderInputContent blockExplHost (IChoice (ChoiceId choiceName party) chosenNum) = do
+  pptd "Choice"
+  pptdWe $ renderParty blockExplHost party
+  pptd $ do string "Choice Id: "
+            string $ unpack choiceName
+  pptd $ string $ show chosenNum
+renderInputContent _ INotify = do
+  pptd "Notify"
+  pptd $ string ""
+  pptd $ string ""
+  pptd $ string ""
+
+renderCTVR :: CTVR -> Html
+renderCTVR CTVR { ctvrContractId = ctvrContractId'
+                , ctvrSelectedTransactionInfo = ctlvrsSelectedTransactionInfo'
+                , ctvrBlockExplHost = blockExplHost
+                } = renderCTLVRTDetail ctvrContractId' blockExplHost ctlvrsSelectedTransactionInfo'
 
 renderTags :: Map String String -> Html
 renderTags tagMap | Map.null tagMap = string "No tags"
-                  | otherwise = table $ do tr $ do
-                                             th $ b "Tag"
-                                             th $ b "Value"
-                                           mapM_ (\(t, v) -> tr $ do
-                                                               td $ string t
-                                                               td $ code $ stringToHtml v
-                                                 ) (Map.toList tagMap)
+                  | otherwise = mapM_ (\(n, (t, v)) -> createFullPopUp ("tag_" ++ show n) t $
+                                                         pre ! class_ "line-numbers" $ code ! class_ "language-javascript" $ stringToHtml v
+                                      ) (zip [(1 :: Integer)..] $ Map.toList tagMap)
 
 renderParty :: String -> Party -> Html
 renderParty blockExplHost (Address ad) = do string "Address: "
@@ -468,17 +602,17 @@ renderParty blockExplHost (Address ad) = do string "Address: "
 renderParty _blockExplHost (Role ro) = string $ "Role: " ++ unpack ro
 
 renderMAccounts :: String -> Map (Party, Token) Money -> Html
-renderMAccounts blockExplHost mapAccounts = table $ do
-  tr $ do
-    th $ b "Party"
-    th $ b "Currency (token name)"
-    th $ b "Amount"
+renderMAccounts blockExplHost mapAccounts = pptable $ do
+  pptr $ do
+    ppth "Party"
+    ppth "Currency (token name)"
+    ppth "Amount"
   let mkRow ((party, token), money) =
         let (tokenString, moneyString) = renderToken token money in
-        tr $ do
-          td $ renderParty blockExplHost party
-          td $ string tokenString
-          td $ string moneyString
+        pptr $ do
+          pptdWe $ renderParty blockExplHost party
+          pptd $ string tokenString
+          pptd $ string moneyString
   mapM_ mkRow $ Map.toList mapAccounts
 
 renderToken :: Token -> Money -> (String, String)
@@ -486,27 +620,27 @@ renderToken (Token "" "") money = ("ADA", prettyPrintAmount 6 money)
 renderToken (Token currSymbol tokenName) money = (printf "%s (%s)" currSymbol tokenName, prettyPrintAmount 0 money)
 
 renderBoundValues :: Map ValueId Integer -> Html
-renderBoundValues mapBoundValues = table $ do
-  tr $ do
-    th $ b "Value Id"
-    th $ b "Value"
+renderBoundValues mapBoundValues = pptable $ do
+  pptr $ do
+    ppth "Value Id"
+    ppth "Value"
   let mkRow (ValueId valueId, bindingValue) =
-        tr $ do
-          td $ string $ T.unpack valueId
-          td $ string $ prettyPrintAmount 0 bindingValue
+        pptr $ do
+          pptd $ string $ T.unpack valueId
+          pptd $ string $ prettyPrintAmount 0 bindingValue
   mapM_ mkRow $ Map.toList mapBoundValues
 
 renderChoices :: String -> Map ChoiceId Integer -> Html
-renderChoices blockExplHost mapChoices = table $ do
-  tr $ do
-    th $ b "Choice Id"
-    th $ b "Party"
-    th $ b "Value"
+renderChoices blockExplHost mapChoices = pptable $ do
+  pptr $ do
+    ppth $ b "Choice Id"
+    ppth $ b "Party"
+    ppth $ b "Value"
   let mkRow (ChoiceId choiceId party, choiceValue) =
-        tr $ do
-          td $ string $ T.unpack choiceId
-          td $ renderParty blockExplHost party
-          td $ string $ prettyPrintAmount 0 choiceValue
+        pptr $ do
+          pptd $ string $ T.unpack choiceId
+          pptdWe $ renderParty blockExplHost party
+          pptd $ string $ prettyPrintAmount 0 choiceValue
   mapM_ mkRow $ Map.toList mapChoices
 
 renderTime :: POSIXTime -> Html
@@ -519,27 +653,26 @@ renderTime =
 renderMState :: String -> Maybe State -> Html
 renderMState _blockExplHost Nothing = string "Contract closed"
 renderMState blockExplHost (Just (State { accounts    = accs
-                          , choices     = chos
-                          , boundValues = boundVals
-                          , minTime     = mtime })) =
-  table $ do tr $ do td $ b "Accounts"
-                     td $ ifEmptyMap accs (string "No accounts") $ renderMAccounts blockExplHost
-             tr $ do td $ b "Bound values"
-                     td $ ifEmptyMap boundVals (string "No bound values") renderBoundValues
-             tr $ do td $ b "Choices"
-                     td $ ifEmptyMap chos (string "No choices") $ renderChoices blockExplHost
-             tr $ do td $ b "minTime"
-                     td $ do renderTime mtime
-                             string $ " (POSIX: " ++ show mtime ++ ")"
+                                        , choices     = chos
+                                        , boundValues = boundVals })) =
+  if null statePopUpList
+  then string "No state"
+  else mconcat statePopUpList
+  where
+  statePopUpList :: [Html]
+  statePopUpList = catMaybes [ ifEmptyMap accs Nothing $ Just . createFullPopUp "accounts" "Accounts" . renderMAccounts blockExplHost
+                             , ifEmptyMap boundVals Nothing $ Just . createFullPopUp "boundValues" "Bindings" . renderBoundValues
+                             , ifEmptyMap chos Nothing $ Just . createFullPopUp "choices" "Choices" . renderChoices blockExplHost
+                             ]
 
-ifEmptyMap :: Map a b -> Html -> (Map a b -> Html) -> Html
+ifEmptyMap :: Map a b -> c -> (Map a b -> c) -> c
 ifEmptyMap mapToCheck defaultHtml renderMapFunc
   | M.null mapToCheck = defaultHtml
   | otherwise = renderMapFunc mapToCheck
 
 renderMContract :: Maybe Contract -> Html
-renderMContract Nothing = string "Contract closed"
-renderMContract (Just c) = code $ stringToHtml $ show $ pretty c
+renderMContract Nothing = H.div ! class_ "contract-code" $ string "Contract closed"
+renderMContract (Just c) = pre ! class_ "line-numbers" $ code ! class_ "language-marlowe contract-code" $ stringToHtml $ show $ pretty c
 
 addNavBar :: ContractViews -> String -> Html -> Html
 addNavBar cv cid c = do
@@ -553,9 +686,19 @@ addNavBar cv cid c = do
   c
 
 linkToTransaction :: String -> String -> String -> Html
-linkToTransaction contractId transactionId' linkText =
-  a ! href (toValue $ generateLink "contractView" [("tab", getNavTab CTxView), ("contractId", contractId), ("transactionId", transactionId')])
-    $ string linkText
+linkToTransaction contractId transactionId' =
+  customLinkToTransaction contractId transactionId' Nothing . string
+
+invisibleLinkToTransaction :: String -> String -> Html -> Html
+invisibleLinkToTransaction contractId transactionId' =
+  customLinkToTransaction contractId transactionId' (Just "invisible-link")
+
+customLinkToTransaction :: String -> String -> Maybe String -> Html -> Html
+customLinkToTransaction contractId transactionId' =
+  addMClass (a ! href (toValue $ generateLink "contractView" [("tab", getNavTab CTxView), ("contractId", contractId), ("transactionId", transactionId')]))
+  where addMClass :: (Html -> Html) -> Maybe String -> Html -> Html
+        addMClass f Nothing = f
+        addMClass f (Just c) = f ! class_ (toValue c)
 
 mkNavLink :: Bool -> String -> String -> String -> Html
 mkNavLink isActive cid tabName tabTitle =
