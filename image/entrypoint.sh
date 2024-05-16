@@ -1,1 +1,1 @@
-/app/result/bin/marlowe-explorer-exe --title-label $TITLE_LABEL --explorer-port $PORT --runtime-host $MARLOWE_RT_WEBSERVER_HOST --runtime-port $MARLOWE_RT_WEBSERVER_PORT --block-explorer $BLOCK_EXPLORER
+/app/result/bin/marlowe-scan-exe --title-label $TITLE_LABEL --marlowe-scan-port $PORT --runtime-host $WEBSERVER_HOST --runtime-port $WEBSERVER_PORT --block-explorer $BLOCK_EXPLORER
